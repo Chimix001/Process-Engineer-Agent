@@ -1,5 +1,5 @@
 # <img width="176" height="190" alt="image" src="https://github.com/user-attachments/assets/ecc86829-644e-40ad-b8f5-1271c5419d91" />
- Castor Oil AI Agent
+# Castor Oil AI Agent
 
 An AI-powered **Retrieval-Augmented Generation (RAG) agent** for answering questions related to castor oil production, extraction, processing, and chemical engineering.
 
