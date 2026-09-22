@@ -1,29 +1,147 @@
-#importing depencies
+import asyncio
+import sys
+from typing import TypedDict, Annotated
 
-from typing import TypedDict, Sequence, Annotated
-from langchain_core.messages import (
-     BaseMessage, HumanMessage,
-       AIMessage, SystemMessage )
-from langchain_core.prompts import ChatPromptTemplate 
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.graph.message import add_messages 
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_groq import ChatGroq
+from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from langgraph.checkpoint.memory import MemorySaver
+import uuid
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+import os
 
-#loading the environment variables
 load_dotenv()
 
-#initializing the LLM
-llm = ChatGoogleGenerativeAI( model="gemini-3.5-flash", temperature=0 )
+llm = ChatGroq(
+    model="openai/gpt-oss-120b")
 
-#prompt
 
-template = """ Answer the question based on the following context and chat history. 
-Especially take the latest question into consideration.
+class AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+    on_topic: bool
+    context: str
 
-Chat history: 
+
+class QuestionClassification(BaseModel):
+    is_chemical_related: bool = Field(
+        description="True if related to chemical/process engineering or castor oil."
+    )
+
+
+classifier_llm = llm.with_structured_output(
+    QuestionClassification, method="function_calling"
+)
+
+
+def question_classifier(state: AgentState):
+    question = state["messages"][-1].content
+    result = classifier_llm.invoke(
+        f"""Determine whether this question is related to a chemical process
+engineering assistant covering: castor oil extraction, physicochemical
+properties, density, viscosity, moisture, flash/fire/pour point,
+saponification value, esterification, transesterification, biodiesel
+characterization, mass balance, oil yield, unit conversion.
+
+Question: {question}
+"""
+    )
+    return {"on_topic": result.is_chemical_related}
+
+
+def topic_router(state: AgentState):
+    return "retriever" if state["on_topic"] else "off_topic"
+
+
+def off_topic_response(state: AgentState):
+    return {
+        "messages": [
+            AIMessage(
+                content=(
+                    "I'm sorry! I can only help with chemical engineering, "
+                    "process engineering, castor oil production, and castor oil extraction."
+                )
+            )
+        ]
+    }
+
+
+_mcp_session: ClientSession | None = None
+
+
+def _expand_query(question: str) -> str:
+    """Rewrite the question into a retrieval-friendly query."""
+    try:
+        resp = llm.invoke(
+            f"""Rewrite the user's question into a search query that will match
+the wording of a chemical engineering lab report about castor oil.
+Include likely keywords such as 'determination', 'formula', 'method',
+'procedure', and any unit names. Return ONLY the rewritten query.
+
+Question: {question}"""
+        )
+        text = resp.content
+        if isinstance(text, list):
+            text = "".join(
+                item.get("text", "") for item in text if isinstance(item, dict)
+            )
+        return text.strip() or question
+    except Exception:
+        return question
+
+
+def make_retriever_node():
+
+    async def retriever_node(state: AgentState):
+
+        if _mcp_session is None:
+            return {
+                "context": "",
+                "messages": [
+                    AIMessage(
+                        content="MCP session is not connected."
+                    )
+                ],
+            }
+
+        question = state["messages"][-1].content
+
+        result = await _mcp_session.call_tool(
+            "search_castor_oil",
+            {"query": question}
+        )
+
+        text = "\n".join(
+            block.text
+            for block in result.content
+            if hasattr(block, "text")
+        )
+
+        return {
+            "context": text
+        }
+
+    return retriever_node
+
+
+answer_prompt = ChatPromptTemplate.from_template(
+    """Answer the question based on the following context and chat history.
+Take the latest question into consideration.
+
+IMPORTANT:
+- Do not use LaTeX.
+- Do not use \\boxed.
+- Do not use \\begin{{aligned}}.
+- Write formulas using normal text.
+- Use simple Markdown when useful.
+- Show calculations clearly.
+- Keep the answer concise.
+
+Chat history:
 {history}
 
 Context:
@@ -32,178 +150,99 @@ Context:
 Question:
 {question}
 """
-prompt = ChatPromptTemplate.from_template(template)
+)
 
-#Agent State
 
-class AgentState(TypedDict):
-    """The state of the agent. 
-    LangGraph keeps track of these values while the workflow runs."""
-    messages: Annotated[
-        Sequence[BaseMessage],
-        add_messages
-    ]
-    on_topic: bool
-
-#question classifer
-
-class QuestionClassification(BaseModel):
-    is_chemical_related: bool = Field(
-        description= (
-        "True if the question is related to chemical engineering," 
-        "process engineering, castor oil production, castor oil extraction," 
-        "oil yield calculations, mass balance, unit conversion,"
-        "castor oil properties, or biodiesel.")
-    )
-
-# Create a structured-output version of the LLM
-classifer_llm = llm.with_structured_output(
-    QuestionClassification,
-      method="json_mode" )
-
-#question classifier 
-def question_classifier(state: AgentState):
-    print("Entering question classifier")
-
-    #get the latest user question
+def answer_node(state: AgentState):
     question = state["messages"][-1].content
-
-    result = classifer_llm.invoke(
-        f"""
-        Determine whether this question is related to a 
-        chemical process engineering assistant.
-
-        The assistant can help with:
-
-        - Castor oil extraction
-        - Materials and methods used to produce castor oil
-        - Physicochemical properties of castor oil
-        - Determination of density
-        - Determination of kinematic viscosity
-        - Determination of moisture content
-        - Determination of flash point
-        - Determination of fire point
-        - Determination of pour point
-        - Determination of saponification value
-        - Esterification experiments
-        - Transesterification experiments
-        - Characterization of castor oil
-        - Characterization of biodiesel
-        - Mass balance
-        - Oil yield calculations
-        - Unit conversion
-        - Chemical process engineering
-
-        Question:
-        {question}
-        Return true if the question is related to the topics above.
-        Return false if the question is unrelated.
-        Respond with JSON only.
-
-        The JSON must have exactly this structure:
-
-        {{
-            "is_chemical_related": true
-              }} 
-              """
-                )
-    print(
-        f"chemical related: {result.is_chemical_related}"
+    history = "\n".join(
+        f"{type(m).__name__}: {m.content}" for m in state["messages"][:-1]
     )
+    prompt = answer_prompt.format(
+        history=history or "(none)",
+        context=state.get("context", "") or "(no context)",
+        question=question,
+    )
+    response = llm.invoke(prompt)
+    content = response.content
+    if isinstance(content, list):
+        content = "".join(
+            item.get("text", "") for item in content if isinstance(item, dict)
+        )
+    return {"messages": [AIMessage(content=content)]}
 
-    return {
-        "on_topic: result.is_chemical_related"
-    }
-
-#Topic ROuter
-def topic_router(state: AgentState):
-    print("Entering Topic Router...")
-    if state["on_topic"]:
-        print("Question relating to chemical Engineering")
-        return "retriever"
-    print("Question off_topic")
-
-    return "off_topic"
-
-#off_topic response
-
-def off_topic_response(state: AgentState):
-    print("Entering off topic response")
-
-    return{
-        "messages": [
-            AIMessage(
-                content=(
-                    "I'm sorry! I can only help with "
-                    "chemical engineering, process engineering, "
-                    "castor oil production, and castor oil extraction."
-                )
-            )
-        
-        ]
-    }
-
-#cannot answer
-def cannot_answer(state: AgentState):
-    print("Entering cannot_answer...")
-    return {
-        "messages": [ AIMessage(
-            content=(
-                "I'm sorry, but I cannot find " "the information you're looking for." ) ) ] }
-
-#Memory
-checkpointer = MemorySaver()
-
-#build the LangGraph
 
 builder = StateGraph(AgentState)
-
-#Add Nodes
-
 builder.add_node("classifier", question_classifier)
 builder.add_node("off_topic", off_topic_response)
-builder.add_node("cannot_answer", cannot_answer)
+builder.add_node("retriever", make_retriever_node())
+builder.add_node("answer", answer_node)
 
-#Edges
 builder.add_edge(START, "classifier")
-
-#classifier - Topic Router
-
-builder.add_conditional_edges("classifier", topic_router,
-                              {"retriever": "cannot_answer",
-                               "off_topic": "off_topic" })
-
-#off_topic - END
-
+builder.add_conditional_edges(
+    "classifier",
+    topic_router,
+    {"retriever": "retriever", "off_topic": "off_topic"},
+)
+builder.add_edge("retriever", "answer")
+builder.add_edge("answer", END)
 builder.add_edge("off_topic", END)
 
-# CANNOT_ANSWER → END 
-builder.add_edge( "cannot_answer", END )
+graph = builder.compile(checkpointer=MemorySaver())
 
-#COMPILE GRAPH
 
-graph = builder.compile(checkpointer=checkpointer)
+_mcp_context = None
+_mcp_session_context = None
 
-#testing the graph
 
-if __name__ == "__name__":
-    quesstion = input("\nAsk a question")
+async def start_mcp():
+    global _mcp_session
+    global _mcp_context
+    global _mcp_session_context
 
-    result = graph.invoke(
-        {
-            "messages":[
-                HumanMessage(content=quesstion)
-                ],
-                "on_topic": False
-        },
-        config={
-            "configurable":{
-                "thread_id": "1"
-            }
-        }
+    server_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "McpServer.py"
     )
 
-    print("\nfinal response:")
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=[server_path],
+    )
 
-    for message in result["messages"]:
-        print(message.content)
+    # Start MCP server
+    _mcp_context = stdio_client(server_params)
+
+    read, write = await _mcp_context.__aenter__()
+
+    # Create MCP session
+    _mcp_session_context = ClientSession(read, write)
+
+    _mcp_session = await _mcp_session_context.__aenter__()
+
+    # Initialize MCP
+    await _mcp_session.initialize()
+
+    # Check available tools
+    tools = await _mcp_session.list_tools()
+
+    print("MCP connected!", file=sys.stderr)
+
+    for tool in tools.tools:
+        print(f"  - {tool.name}", file=sys.stderr)
+
+
+async def stop_mcp():
+    global _mcp_session
+    global _mcp_context
+    global _mcp_session_context
+
+    _mcp_session = None
+
+    if _mcp_session_context:
+        await _mcp_session_context.__aexit__(None, None, None)
+
+    if _mcp_context:
+        await _mcp_context.__aexit__(None, None, None)
+
+    print("MCP connection closed.", file=sys.stderr)
