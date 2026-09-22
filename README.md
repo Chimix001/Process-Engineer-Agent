@@ -250,6 +250,11 @@ After activating the virtual environment, run:
 python main.py
 ```
 
+or for streamlit app run:
+```bash
+streamlt_run.py
+```
+
 Depending on the implementation, you can then enter questions through the terminal.
 
 Example:
